@@ -1,7 +1,6 @@
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium import webdriver
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 import time
 from selenium.webdriver.chrome.options import Options
@@ -41,16 +40,53 @@ CREATE TABLE IF NOT EXISTS reviews (
 """)
 conn.commit()
 
+BATCH_SIZE = 100  # 몇 개마다 DB에 저장할지
+
+def save_batch(conn, product_id, product_name, name_list, skin_list, star_list,
+               date_list, good_list, text_list, already_saved_count):
+    """already_saved_count 이후의 새 항목만 DB에 저장"""
+    saved = 0
+    for i in range(already_saved_count, len(name_list)):
+        conn.execute("""
+            INSERT INTO reviews
+            (product_id, product_name, author, skin_type, rating, review_date, option, review_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id, product_name,
+            name_list[i], skin_list[i], star_list[i],
+            date_list[i], good_list[i], text_list[i]
+        ))
+        saved += 1
+    conn.commit()
+    return saved
+
 # ── 무한스크롤 리뷰 수집 함수 ─────────────────────────────────
-def scroll_and_crawl(driver, product_id, product_name, target_count=500):
+def scroll_and_crawl(driver, product_id, product_name, target_count=10000):
     name_list, skin_list, star_list = [], [], []
     date_list, good_list, text_list = [], [], []
-    collected_reviews = set()
+
+    # 재시작 시 이미 DB에 있는 리뷰 텍스트 로드 → 중복 방지
+    existing = set(
+        row[0] for row in conn.execute(
+            "SELECT review_text FROM reviews WHERE product_id = ?", (product_id,)
+        )
+    )
+    collected_reviews = set(existing)
+    print(f"기존 DB에 저장된 리뷰: {len(existing)}개 (중복 스킵 적용)")
+
     no_new_count = 0
+    last_saved_index = 0
+    total_db_saved = 0
 
     while len(name_list) < target_count:
-        shadow = Shadow(driver)
-        users = shadow.find_elements('div.inner')
+        try:
+            shadow = Shadow(driver)
+            users = shadow.find_elements('div.inner')
+        except Exception as e:
+            print(f"Shadow DOM 접근 실패, 재시도: {e}")
+            time.sleep(3)
+            continue
+
         initial_count = len(name_list)
 
         for user in users:
@@ -64,20 +100,16 @@ def scroll_and_crawl(driver, product_id, product_name, target_count=500):
                 # 리뷰 본문
                 text_shadow = text_hosts[0].shadow_root
                 t_el = text_shadow.find_elements(By.CSS_SELECTOR, 'div.content')
-                # div.content 없으면 p 태그로 fallback
                 if not t_el:
                     t_el = text_shadow.find_elements(By.CSS_SELECTOR, 'p')
                 review_text = t_el[0].text.strip() if t_el else ""
 
-                # 중복 & 빈 내용 제외
                 if not review_text or review_text in collected_reviews:
                     continue
 
-                # 날짜 확인 → 2022-12-31 이후면 스킵
+                # 날짜
                 date = user.find_elements(By.CSS_SELECTOR, 'div.common-info span.date')
                 date_text = date[0].text if date else None
-                if date_text and date_text > '2022.12.31':
-                    continue  # 최신 리뷰 스킵
 
                 # 유저 정보
                 user_shadow = user_hosts[0].shadow_root
@@ -97,38 +129,42 @@ def scroll_and_crawl(driver, product_id, product_name, target_count=500):
                 if len(name_list) >= target_count:
                     break
 
-            except:
+            except Exception:
                 continue
 
-        # 스크롤 내리기
+        # ── 배치 저장 ─────────────────────────────────────────
+        if len(name_list) - last_saved_index >= BATCH_SIZE:
+            saved = save_batch(conn, product_id, product_name,
+                               name_list, skin_list, star_list,
+                               date_list, good_list, text_list,
+                               last_saved_index)
+            total_db_saved += saved
+            last_saved_index = len(name_list)
+            print(f"💾 배치 저장: +{saved}개 (누적 DB: {total_db_saved}개)")
+
+        # 스크롤
         driver.execute_script("window.scrollBy(0, 2000);")
         time.sleep(4)
 
         if len(name_list) == initial_count:
             no_new_count += 1
-            print(f"새로운 리뷰 로딩 대기 중... ({no_new_count}/3)")
+            print(f"새로운 리뷰 로딩 대기 중... ({no_new_count}/7)")
         else:
             no_new_count = 0
 
-        if no_new_count >= 3:
+        if no_new_count >= 7:
             print("더 이상 불러올 리뷰가 없어 수집을 종료합니다.")
             break
 
         print(f"현재 수집된 리뷰: {len(name_list)}개...")
 
-    # ── DB 저장 ──────────────────────────────────────────────
-    for i in range(len(name_list)):
-        conn.execute("""
-            INSERT INTO reviews 
-            (product_id, product_name, author, skin_type, rating, review_date, option, review_text)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            product_id, product_name,
-            name_list[i], skin_list[i], star_list[i],
-            date_list[i], good_list[i], text_list[i]
-        ))
-    conn.commit()
-    print(f"✅ DB 저장 완료: {len(name_list)}개")
+    # ── 나머지 저장 ───────────────────────────────────────────
+    saved = save_batch(conn, product_id, product_name,
+                       name_list, skin_list, star_list,
+                       date_list, good_list, text_list,
+                       last_saved_index)
+    total_db_saved += saved
+    print(f"✅ 수집 완료: 전체 {len(name_list)}개 수집 / DB 저장 {total_db_saved}개 (2022년 이전)")
 
     return name_list, skin_list, star_list, date_list, good_list, text_list
 
@@ -158,7 +194,7 @@ time.sleep(3)
 
 # 수집 실행
 names, skins, stars, dates, options, texts = scroll_and_crawl(
-    driver, PRODUCT_ID, PRODUCT_NAME, target_count=500
+    driver, PRODUCT_ID, PRODUCT_NAME, target_count=10000
 )
 
 # 결과 확인
